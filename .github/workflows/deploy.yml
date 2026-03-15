@@ -1,0 +1,219 @@
+name: CI/CD — Build, Push & Deploy
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  ACR_LOGIN_SERVER: ${{ secrets.ACR_LOGIN_SERVER }}
+  IMAGE_BACKEND:    crud-api
+  IMAGE_FRONTEND:   crud-frontend
+
+jobs:
+
+  # ── 1. Build & Test Backend ───────────────────────────────
+  build-backend:
+    name: Build .NET API
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend/CrudApi
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Restore & Build
+        run: |
+          dotnet restore
+          dotnet build --no-restore --configuration Release
+
+  # ── 2. Build Frontend ─────────────────────────────────────
+  build-frontend:
+    name: Build Next.js
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install & Build
+        run: |
+          npm ci
+          npm run build
+        env:
+          NEXT_PUBLIC_API_URL: "http://placeholder"
+
+  # ── 3. Docker Build & Push to ACR ────────────────────────
+  docker-push:
+    name: Docker Build & Push
+    runs-on: ubuntu-latest
+    needs: [ build-backend, build-frontend ]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    outputs:
+      image_tag: ${{ steps.tag.outputs.sha }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set image tag
+        id: tag
+        run: echo "sha=${GITHUB_SHA::8}" >> $GITHUB_OUTPUT
+
+      - name: Login to ACR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ secrets.ACR_LOGIN_SERVER }}
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+
+      - name: Build & Push backend
+        run: |
+          docker build \
+            -t ${{ env.ACR_LOGIN_SERVER }}/${{ env.IMAGE_BACKEND }}:${{ steps.tag.outputs.sha }} \
+            -t ${{ env.ACR_LOGIN_SERVER }}/${{ env.IMAGE_BACKEND }}:latest \
+            ./backend/CrudApi
+          docker push ${{ env.ACR_LOGIN_SERVER }}/${{ env.IMAGE_BACKEND }}:${{ steps.tag.outputs.sha }}
+          docker push ${{ env.ACR_LOGIN_SERVER }}/${{ env.IMAGE_BACKEND }}:latest
+
+      - name: Build & Push frontend
+        run: |
+          docker build \
+            -t ${{ env.ACR_LOGIN_SERVER }}/${{ env.IMAGE_FRONTEND }}:${{ steps.tag.outputs.sha }} \
+            -t ${{ env.ACR_LOGIN_SERVER }}/${{ env.IMAGE_FRONTEND }}:latest \
+            ./frontend
+          docker push ${{ env.ACR_LOGIN_SERVER }}/${{ env.IMAGE_FRONTEND }}:${{ steps.tag.outputs.sha }}
+          docker push ${{ env.ACR_LOGIN_SERVER }}/${{ env.IMAGE_FRONTEND }}:latest
+
+  # ── 4. Deploy Backend to AKS ─────────────────────────────
+  deploy-backend:
+    name: Deploy Backend to AKS
+    runs-on: ubuntu-latest
+    needs: docker-push
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    outputs:
+      api_ip: ${{ steps.getip.outputs.ip }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: |
+            {
+              "clientId": "${{ secrets.AZURE_CLIENT_ID }}",
+              "clientSecret": "${{ secrets.AZURE_CLIENT_SECRET }}",
+              "subscriptionId": "${{ secrets.AZURE_SUBSCRIPTION_ID }}",
+              "tenantId": "${{ secrets.AZURE_TENANT_ID }}"
+            }
+
+      - name: Get AKS credentials
+        run: |
+          az aks get-credentials \
+            --resource-group ${{ secrets.RESOURCE_GROUP }} \
+            --name ${{ secrets.AKS_CLUSTER_NAME }} \
+            --overwrite-existing
+
+      - name: Run DB Migration
+        run: |
+          dotnet tool install --global dotnet-ef
+          cd backend/CrudApi
+          dotnet ef database update \
+            --connection "${{ secrets.PG_CONNECTION_STRING }}"
+
+      - name: Deploy to AKS
+        run: kubectl apply -f k8s/backend-deployment.yaml
+
+      - name: Update image tag
+        run: |
+          kubectl set image deployment/crud-api \
+            crud-api=${{ secrets.ACR_LOGIN_SERVER }}/crud-api:${{ needs.docker-push.outputs.image_tag }}
+
+      - name: Wait for rollout
+        run: kubectl rollout status deployment/crud-api --timeout=120s
+
+      - name: Get External IP
+        id: getip
+        run: |
+          echo "Waiting for External IP..."
+          for i in {1..20}; do
+            IP=$(kubectl get service crud-api-service \
+              -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null)
+            if [ -n "$IP" ] && [ "$IP" != "null" ]; then
+              echo "External IP found: $IP"
+              echo "ip=$IP" >> $GITHUB_OUTPUT
+              break
+            fi
+            echo "Attempt $i/20 — waiting 15s..."
+            sleep 15
+          done
+          if [ -z "$IP" ]; then
+            echo "ERROR: Could not get External IP"
+            exit 1
+          fi
+
+  # ── 5. Deploy Frontend to App Service ────────────────────
+  deploy-frontend:
+    name: Deploy Frontend to App Service
+    runs-on: ubuntu-latest
+    needs: [ docker-push, deploy-backend ]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    steps:
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: |
+            {
+              "clientId": "${{ secrets.AZURE_CLIENT_ID }}",
+              "clientSecret": "${{ secrets.AZURE_CLIENT_SECRET }}",
+              "subscriptionId": "${{ secrets.AZURE_SUBSCRIPTION_ID }}",
+              "tenantId": "${{ secrets.AZURE_TENANT_ID }}"
+            }
+
+      - name: Set API URL in App Service
+        run: |
+          az webapp config appsettings set \
+            --name ${{ secrets.AZURE_WEBAPP_NAME }} \
+            --resource-group ${{ secrets.RESOURCE_GROUP }} \
+            --settings \
+              NEXT_PUBLIC_API_URL=http://${{ needs.deploy-backend.outputs.api_ip }} \
+              PORT=3000
+
+      - name: Deploy frontend to App Service
+        uses: azure/webapps-deploy@v3
+        with:
+          app-name: ${{ secrets.AZURE_WEBAPP_NAME }}
+          images: ${{ secrets.ACR_LOGIN_SERVER }}/${{ env.IMAGE_FRONTEND }}:${{ needs.docker-push.outputs.image_tag }}
+
+      - name: Restart App Service
+        run: |
+          az webapp restart \
+            --name ${{ secrets.AZURE_WEBAPP_NAME }} \
+            --resource-group ${{ secrets.RESOURCE_GROUP }}
+
+      - name: Deployment Summary
+        run: |
+          echo "### Deployment Complete! 🚀" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Service | URL |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------|-----|" >> $GITHUB_STEP_SUMMARY
+          echo "| Frontend | https://${{ secrets.AZURE_WEBAPP_NAME }}.azurewebsites.net |" >> $GITHUB_STEP_SUMMARY
+          echo "| Products | https://${{ secrets.AZURE_WEBAPP_NAME }}.azurewebsites.net |" >> $GITHUB_STEP_SUMMARY
+          echo "| Blogs | https://${{ secrets.AZURE_WEBAPP_NAME }}.azurewebsites.net/blogs |" >> $GITHUB_STEP_SUMMARY
+          echo "| API Swagger | http://${{ needs.deploy-backend.outputs.api_ip }}/swagger |" >> $GITHUB_STEP_SUMMARY
+          echo "| Image Tag | \`${{ needs.docker-push.outputs.image_tag }}\` |" >> $GITHUB_STEP_SUMMARY
